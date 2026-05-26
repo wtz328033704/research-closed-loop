@@ -27,6 +27,9 @@ Thumbs.db
 # Claude Code local settings
 .claude/settings.local.json
 
+# Third-party skills (install separately — see README)
+.claude_skills/
+
 # NotebookLM credentials
 *.session.json
 .notebooklm*/
