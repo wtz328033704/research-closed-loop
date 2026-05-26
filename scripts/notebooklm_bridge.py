@@ -155,23 +155,91 @@ class NotebookLMBridge:
         """Upload a PDF or URL source to a notebook."""
         try:
             result = self._run_nlm("source", "add", "--notebook", notebook_name,
-                                   "--type", source_type, source_path, timeout=120)
+                                   "--type", source_type, source_path, "--wait",
+                                   timeout=300)
             return result.returncode == 0
+        except RuntimeError as e:
+            if "NLM_AUTH_EXPIRED" in str(e):
+                raise
+            print(f"  ✗ Auth expired: {source_path[-60:]}")
+            return False
         except Exception as e:
-            print(f"MCP upload failed: {e}")
+            print(f"  ✗ Upload failed: {source_path[-60:]} — {e}")
             return False
 
     def upload_sources_batch(self, notebook_name: str, sources: list[str],
-                             source_type: str = "pdf") -> dict:
-        """Upload multiple sources. Returns success/failure counts."""
-        ok, fail = 0, 0
+                             source_type: str = "pdf",
+                             resume_file: str = None) -> dict:
+        """
+        Upload multiple sources with progress bar and resume support.
+
+        Args:
+            notebook_name: Target notebook name/ID
+            sources: List of source paths/URLs
+            source_type: 'pdf', 'url', 'youtube', or 'drive'
+            resume_file: Path to a JSON file tracking completed uploads.
+                         If provided, skips already-uploaded sources.
+
+        Returns dict with uploaded/failed/skipped counts and per-item results.
+        """
         max_sources = self.nlm_config["max_sources_per_notebook"]
-        for src in sources[:max_sources]:
-            if self.upload_source(notebook_name, src, source_type):
-                ok += 1
+        to_upload = sources[:max_sources]
+
+        # Resume support: skip already-uploaded
+        completed = set()
+        if resume_file and os.path.exists(resume_file):
+            try:
+                with open(resume_file, "r") as f:
+                    completed = set(json.load(f).get("completed", []))
+                print(f"  Resuming: {len(completed)} already uploaded, {len(to_upload) - len([s for s in to_upload if s in completed])} remaining")
+            except Exception:
+                pass
+
+        results = {"uploaded": 0, "failed": 0, "skipped": len(completed),
+                   "total": len(to_upload), "items": [], "completed_list": list(completed)}
+        pending = [(i, s) for i, s in enumerate(to_upload) if s not in completed]
+
+        for idx, (orig_idx, src) in enumerate(pending):
+            bar_len = 20
+            done = idx + 1
+            total = len(pending)
+            bar = "█" * (done * bar_len // max(total, 1)) + "░" * (bar_len - done * bar_len // max(total, 1))
+
+            src_short = src[-60:] if len(src) > 60 else src
+            print(f"  [{bar}] {done}/{total} {src_short}", end="", flush=True)
+
+            try:
+                success = self.upload_source(notebook_name, src, source_type)
+            except RuntimeError:
+                print(" ⚠ auth expired")
+                results["items"].append({"index": orig_idx, "source": src_short, "status": "auth_error"})
+                results["failed"] += 1
+                break  # don't continue on auth error
+
+            if success:
+                results["uploaded"] += 1
+                results["completed_list"].append(src)
+                results["items"].append({"index": orig_idx, "source": src_short, "status": "ok"})
+                print(" ✓")
             else:
-                fail += 1
-        return {"uploaded": ok, "failed": fail, "total": len(sources[:max_sources])}
+                results["failed"] += 1
+                results["items"].append({"index": orig_idx, "source": src_short, "status": "failed"})
+                print(" ✗")
+
+            # Save resume state after each successful upload
+            if resume_file:
+                try:
+                    os.makedirs(os.path.dirname(resume_file), exist_ok=True)
+                    with open(resume_file, "w") as f:
+                        json.dump({"completed": results["completed_list"]}, f)
+                except Exception:
+                    pass
+
+        # Clean up resume file on complete success
+        if resume_file and results["failed"] == 0 and os.path.exists(resume_file):
+            os.remove(resume_file)
+
+        return results
 
     def ask_notebook(self, notebook_name: str, question: str) -> Optional[str]:
         """Query a notebook and get a source-grounded answer with citations."""
